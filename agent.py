@@ -93,4 +93,55 @@ def tool_write_file(path:str, content:str, workspace:str, approve_mode:str = "as
 
 # test: print(tool_write_file("test.txt", "hello", "/home/RYVEN/mini_agent/", "ask"))
 
+SYSTEM_PROMPT = """ You are an autonomous ML research agent. You have access to these tools:
+- read_file(path): Read a file in the workspace
+- write_file(path, content): Write content to a file
 
+When you want to use a tool, output EXACTLY this XML format:
+<tool>
+<name>read_file</name>
+<path>train.py</path>
+</tool>
+
+If you are done and have no more actions, output:
+<final>I have completed the task.</final>"""
+
+
+
+def parse_response(response:str):
+    tool_match = re.search(r'<tool>(.*?)</tool>', response, re.DOTALL)
+    if tool_match:
+        inner = tool_match.group(1)
+
+        name_match = re.search(r'<name>(.*?)</name>', inner, re.DOTALL)
+        path_match = re.search(r'<path>(.*?)</path>', inner, re.DOTALL)
+
+        if name_match is None:
+            return {"type": "error", "raw": response, "reason": "tool missing name"}
+        # build result
+        result = {
+                "type": "tool",
+                "name": name_match.group(1).strip()
+                }
+
+        if path_match:
+            result["path"] = path_match.group(1).strip()
+
+        return result
+
+    final_match = re.search(r'<final>(.*?)</final>', response, re.DOTALL)
+    if final_match:
+        return {
+                "type": "final",
+                "message": final_match.group(1).strip()
+                }
+    return {"type": "error", "raw": response, "reason": "no tool or final tag found!"}
+
+
+test1 = "<tool>\n<name>tool_read_file</name>\n<path>train.py</path>\n</tool>"
+test2 = "<final>I am done with this task</final>"
+test3 = "I think I should read the file first"
+
+print(parse_response(test1))
+print(parse_response(test2))
+print(parse_response(test3))
