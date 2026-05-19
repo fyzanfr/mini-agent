@@ -139,6 +139,138 @@ class WorkspaceContext:
         ])
 
 
+## -- Tools:
+
+TOOLS = {
+    "list_files": {
+        "schema": {"path": "str='.'"},
+        "risky": False,
+        "description": "List files in the workspace directory.",
+    },
+    "read_file": {
+        "schema": {"path": "str", "start": "int=1", "end": "int=200"},
+        "risky": False,
+        "description": "Read a file by line range.",
+    },
+    "patch_file": {
+        "schema": {"path": "str", "old_text": "str", "new_text": "str"},
+        "risky": True,
+        "description": "Replace exact text block in a file.",
+    },
+    "run_experiment": {
+        "schema": {"diff": "str", "hypothesis": "str"},
+        "risky": True,
+        "description": "Apply diff, train for 5 min, measure val_bpb, keep or discard.",
+    },
+}
+
+
+
+## -- Prompt:
+
+class PromptBuilder:
+    def __init__(self, workspace, goal, protected_files):
+        self.workspace = workspace
+        self.goal = goal
+        self.protected_files = protected_files
+        self.experiment_memory = []
+        self.history = []
+        self.tools = TOOLS
+
+    def build_prefix(self):
+        tool_list = []
+        for name, tool in self.tools.items():
+            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
+            risk = "approval required" if tool["risky"] else "safe"
+            tool_list.append(f"- {name}({fields}) [{risk}] {tool['description']}")
+        tool_text = "\n".join(tool_list)
+        examples = "\n".join(
+                [
+                    '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+                    '<tool>{"name":"read_file","args":{"path":"train.py","start":1,"end":50}}</tool>',
+                    '<tool name="patch_file" path="train.py"><old_text>DEPTH = 8</old_text><new_text>DEPTH = 12</new_text></tool>',
+                    '<tool name="run_experiment"><diff>--- a/train.py\n+++ b/train.py\n@@ -15,7 +15,7 @@\n-DEPTH = 8\n+DEPTH = 12\n</diff><hypothesis>Increase depth from 8 to 12 layers</hypothesis></tool>',
+                    '<final>I have completed all experiments.</final>',
+                ]
+            )
+        rules = "\n".join([
+            "- Return exactly one <tool>...</tool> or one <final>...</final>.",
+            "- Tool calls must look like:",
+            '  <tool>{"name":"tool_name","args":{...}}</tool>',
+            "- For patch_file and run_experiment with multi-line text, prefer XML style.",
+            "- Final answers must look like: <final>your answer</final>",
+            "- Never invent tool results.",
+            "- Keep answers concise and concrete.",
+            "- Do not repeat the same tool call with the same arguments if it did not help.",
+            f"- Your goal: {self.goal}",
+            f"- Protected files (never modify): {', '.join(self.protected_files)}",
+            "- Only modify train.py. This is your sole target file.",
+            "- Each experiment runs for exactly 5 minutes. The harness handles timing.",
+            "- After run_experiment, you will see the result and metric.",
+            "- Learn from failed experiments. Do not repeat changes that crashed or worsened the metric.",
+            "- Propose one experiment at a time. Wait for the result before proposing the next.",
+        ])
+
+        return "\n\n".join([
+            "You are an autonomous research agent, a small local coding agent running through Ollama.",
+            "Rules:\n" + rules,
+            "Tools:\n" + tool_text,
+            "Valid response examples:\n" + examples,
+            self.workspace.text(),
+        ])
+
+
+    def memory(self):
+        best_metric = float('inf')
+        best_exp = None
+        kept_count = 0
+        failed_patterns = []
+
+        for exp in self.experiment_memory:
+            if exp["status"] == "kept" and exp["metric"] < best_metric:
+                best_metric = exp["metric"]
+                best_exp = exp["id"]
+            elif exp["status"] in ("discarded", "crashsed"):
+                failed_patterns.append(f"#{exp["id"]}: {exp["hypothesis"][:60]}...({exp["status"]})")
+
+        best_line = ( 
+                     f"Best so far: {best_metric:.4f} (experiment #{best_exp})" 
+                     if best_exp else "No successful experiments yet."
+                     )
+
+        failed_lines = "\n".join(f"- {p}" for p in failed_patterns[-5:]) or "- none"
+        
+        return "\n".join([
+        "Experiment Memory:",
+        f"- Total experiments: {len(self.experiment_memory)}",
+        best_line,
+        f"- Recent failures (do not repeat):",
+        failed_lines,
+        ])
+
+
+    def history_text(self):
+        if not self.history:
+            return "- empty"
+        
+        lines = []
+        for item in self.history[-3:]:  # Only last 3 to save context
+            lines.append(f"[{item['role']}] {item['content'][:200]}")
+        
+        return "\n".join(lines)
+
+
+    def prompt(self, task="Propose the next experiment."):
+        return "\n\n".join([
+        self.build_prefix(),
+        self.memory(),
+        "Recent History:\n" + self.history_text(),
+        "Current Task:\n" + task,
+    ])
+
+
+
+
 
 
 ### args
@@ -169,7 +301,16 @@ def main(argv=None):
         )
 
     workspace_context = WorkspaceContext.build(args.cwd)
-    print(workspace_context.text())
+    
+    builder = PromptBuilder(
+        workspace=workspace_context,
+        goal="Minimize val_bpb (validation bits per byte). Lower is better.",
+        protected_files={"prepare.py", "program.md"}
+    )
+    prompt = builder.prompt("Propose the first experiment to improve model performance.")
+    print(prompt)
+    print("\n" + "="*80 + "\n")
+    print(f"Prompt length: {len(prompt)} characters")
 
 if __name__ == "__main__":
     main()
