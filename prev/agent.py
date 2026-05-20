@@ -141,6 +141,70 @@ class WorkspaceContext:
 
 ## -- Tools:
 
+def list_files(path, workspace):
+    target = (Path(workspace)/path).resolve()
+    ws = Path(workspace).resolve()
+
+    if not target.is_relative_to(ws):
+        return f"Error: outside workspace"
+    if not target.exists():
+        return f"Error: no such directory"
+    if not target.is_dir():
+        return f"Error: not a directory"
+
+    lines = []
+    for entry in sorted(target.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
+        if entry.name in {".git", "__pycache__"}:
+            continue
+        kind = "F" if entry.is_file() else "D"
+        rel = entry.relative_to(ws)
+        lines.append(f"[{kind}] {rel}")
+    
+    return "\n".join(lines) or "(empty)"
+
+
+def read_file(path, workspace, start=1, end=200):
+    target = (Path(workspace) / path).resolve()
+    ws = Path(workspace).resolve()
+    
+    if not target.is_relative_to(ws):
+        return f"Error: outside workspace"
+    if not target.is_file():
+        return f"Error: not a file"
+    
+    lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    body = "\n".join(f"{n:>4}: {line}" for n, line in enumerate(lines[start-1:end], start=start))
+    return f"# {target.relative_to(ws)}\n{body}"
+
+
+def patch_file(path, old_txt, new_txt, workspace):
+    target = (Path(workspace) / path).resolve()
+    ws = Path(workspace).resolve()
+    
+    if not target.is_relative_to(ws):
+        return f"Error: outside workspace"
+    if target.name in {"prepare.py", "program.md"}:
+        return f"Error: protected file"
+    if not target.is_file():
+        return f"Error: not a file"
+    
+    text = target.read_text(encoding="utf-8")
+    count = text.count(old_text)
+    
+    if count == 0:
+        return "Error: old_text not found"
+    if count > 1:
+        return f"Error: old_text appears {count} times (must be unique)"
+    
+    target.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
+    return f"Patched {path}"
+
+
+
+def run_experiment(diff, hypothesis, workspace):
+    return f"Experiment placeholder: {hypothesis[:50]}..."
+
+
 TOOLS = {
     "list_files": {
         "schema": {"path": "str='.'"},
@@ -164,6 +228,35 @@ TOOLS = {
     },
 }
 
+
+TOOL_RUNNERS = {
+    "list_files": list_files,
+    "read_file": read_file,
+    "patch_file": patch_file,
+    "run_experiment": run_experiment,
+}
+
+
+def run_tool(name, args, workspace, approval_mode):
+    func = TOOL_RUNNERS.get(name)
+    if func is None:
+        return f"Error: unknown tool '{name}'"
+    
+    kwargs = dict(args)
+    kwargs["workspace"] = workspace
+
+    if name in {"patch_file", "run_experiment"}:
+        if approval_mode == "never":
+            return f"Error: approval denied"
+        if approval_mode == "ask":
+            ans = input(f"Approve {name}({args})? [y/N] ")
+            if ans.strip().lower() not in {"y", "yes"}:
+                return f"Error: approval denied"
+    
+    try:
+        return func(**kwargs)
+    except Exception as exc:
+        return f"Error: {name} failed: {exc}"
 
 
 ## -- Prompt:
@@ -270,6 +363,119 @@ class PromptBuilder:
 
 
 
+def parse_response(response: str):
+    """Parse agent response into tool call, final answer, or error."""
+    response = str(response)
+    
+    # Try JSON-style tool: <tool>{"name":"...","args":{...}}</tool>
+    if "<tool>" in response and ("<final>" not in response or response.find("<tool>") < response.find("<final>")):
+        body = extract(response, "tool")
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return "retry", "Malformed tool JSON. Use valid <tool>{...}</tool> format."
+        
+        if not isinstance(payload, dict):
+            return "retry", "Tool payload must be a JSON object."
+        if not str(payload.get("name", "")).strip():
+            return "retry", "Tool payload missing name."
+        
+        args = payload.get("args", {})
+        if args is None:
+            payload["args"] = {}
+        elif not isinstance(args, dict):
+            return "retry", "Tool args must be a JSON object."
+        
+        return "tool", payload
+    
+    # Try XML-style tool: <tool name="..." path="..."><content>...</content></tool>
+    if "<tool" in response and ("<final>" not in response or response.find("<tool") < response.find("<final>")):
+        payload = parse_xml_tool(response)
+        if payload is not None:
+            return "tool", payload
+        return "retry", "Malformed XML tool. Check your format."
+    
+    # Try final answer: <inal>...</final>
+    if "<final>" in response:
+        final = extract(response, "final").strip()
+        if final:
+            return "final", final
+        return "retry", "Empty <final> answer. Provide content."
+    
+    # Raw text with no tags — treat as final if non-empty
+    stripped = response.strip()
+    if stripped:
+        return "final", stripped
+    
+    return "retry", "Empty response. Use <tool> or <final>."
+
+
+def extract(text: str, tag: str) -> str:
+    """Extract content between <tag>...</tag>."""
+    start_tag = f"<{tag}>"
+    end_tag = f"</{tag}>"
+    start = text.find(start_tag)
+    if start == -1:
+        return text
+    start += len(start_tag)
+    end = text.find(end_tag, start)
+    if end == -1:
+        return text[start:].strip()
+    return text[start:end].strip()
+
+
+def parse_xml_tool(raw: str):
+    """Parse XML-style tool call like <tool name="patch_file" path="...">...</tool>."""
+    match = re.search(r'<tool(?P<attrs>[^>]*)>(?P<body>.*?)</tool>', raw, re.S)
+    if not match:
+        return None
+    
+    attrs = parse_attrs(match.group("attrs"))
+    name = str(attrs.pop("name", "")).strip()
+    if not name:
+        return None
+    
+    body = match.group("body")
+    args = dict(attrs)
+    
+    # Extract common XML content tags
+    for key in ("content", "old_text", "new_text", "diff", "hypothesis", "command", "task", "pattern", "path"):
+        if f"<{key}>" in body:
+            args[key] = extract_raw(body, key)
+    
+    # Fallback: if no recognized tags, treat body as content for write_file
+    body_text = body.strip("\n")
+    if name == "write_file" and "content" not in args and body_text:
+        args["content"] = body_text
+    if name == "run_experiment" and "diff" not in args and body_text:
+        # Try to extract diff from body
+        if "---" in body_text:
+            args["diff"] = body_text
+    
+    return {"name": name, "args": args}
+
+
+def parse_attrs(text: str):
+    """Parse attribute string like name="patch_file" path="train.py"."""
+    attrs = {}
+    for match in re.finditer(r"""([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:"([^"]*)"|'([^']*)')""", text):
+        attrs[match.group(1)] = match.group(2) if match.group(2) is not None else match.group(3)
+    return attrs
+
+
+def extract_raw(text: str, tag: str) -> str:
+    """Extract raw content between tags (preserves whitespace)."""
+    start_tag = f"<{tag}>"
+    end_tag = f"</{tag}>"
+    start = text.find(start_tag)
+    if start == -1:
+        return text
+    start += len(start_tag)
+    end = text.find(end_tag, start)
+    if end == -1:
+        return text[start:]
+    return text[start:end]
+
 
 
 
@@ -285,7 +491,8 @@ def build_arg_parser():
     parser.add_argument("--ollama-timeout", type=int, default=300, help="Ollama request timeout")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
-
+    parser.add_argument("--approval", choices=("ask", "auto", "never"), default="ask")
+    parser.add_argument("--max-steps", type=int, default=6)
     return parser
 
 
@@ -307,10 +514,45 @@ def main(argv=None):
         goal="Minimize val_bpb (validation bits per byte). Lower is better.",
         protected_files={"prepare.py", "program.md"}
     )
-    prompt = builder.prompt("Propose the first experiment to improve model performance.")
-    print(prompt)
-    print("\n" + "="*80 + "\n")
-    print(f"Prompt length: {len(prompt)} characters")
+
+    for step in range(6):
+        print(f"\n{'='*50}")
+        print(f"[Step {step+1}/6]")
+        
+        prompt = builder.prompt()
+        print(f"Prompt: {len(prompt)} chars")
+        
+        response = client.complete(prompt, max_new_tokens=512)
+        print(f"Agent: {response[:150]}...")
+        
+        kind, payload = parse_response(response)
+        
+        if kind == "final":
+            print(f"Done: {payload}")
+            break
+        
+        if kind == "retry":
+            print(f"Parse error: {payload}")
+            builder.history.append({"role": "system", "content": f"Error: {payload}"})
+            continue
+        
+        if kind == "tool":
+            name = payload.get("name")
+            args = payload.get("args", {})
+            print(f"Tool: {name}({args})")
+            
+            result = run_tool(name, args, str(workspace_context.cwd), "ask")
+            print(f"Result: {result[:150]}...")
+            
+            builder.history.append({
+                "role": "tool",
+                "content": f"{name}: {result}"
+            })
+    
+    print("\nLoop finished.")
+
 
 if __name__ == "__main__":
     main()
+
+
