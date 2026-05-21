@@ -2,7 +2,18 @@ import json
 import subprocess
 from llama_cpp import Llama, LlamaGrammar
 
-MODEL_PATH = "/home/RYVEN/mini_agent/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+MODEL_PATH = "/home/RYVEN/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+
+
+# -- Utility:
+
+def slice(output, max_chars=2000):
+    if not output:
+        return ""
+    text = str(output)
+    if len(text) > max_chars:
+        return text[:max_chars] + f"\n.. [OUTPUT TRUNCATED..]"
+
 
 AGENT_GRAMMAR = r"""
 root ::= tool | final
@@ -30,17 +41,26 @@ space ::= [ \t\n]*
 
 grammar = LlamaGrammar.from_string(AGENT_GRAMMAR)
 
-llm = Llama(model_path=MODEL_PATH, 
+llm = Llama(model_path=MODEL_PATH,
+            n_ctx = 4096,
             verbose=False)
 
-prompt = """
-System: You are an AI Agent. You must output JSON. You have a tool called run_shell that takes a cmd argument.
-User: What files are in my current directory?
+system_prompt = """You are an elite, local AI agent running natively on Arch Linux.
+You have FULL ACCESS to the local file system. 
+
+CRITICAL RULES:
+- You MUST respond in pure, valid JSON.
+- To execute a command: {"type": "tool", "name": "run_shell", "args": {"cmd": "<command>"}}
+- To answer the user: {"type": "final", "content": "<your response>"}
+- If the user asks for information, you MUST include the actual data from your Observation in your 'final' content. Do not use placeholders.
 """
 
-output = llm(prompt, grammar=grammar, max_tokens=200)
+# -- Memory:
+messages = [
+        {"role": "system", "content": system_prompt}
+    ]
 
-raw_text = output['choices'][0]['text']
+
 
 
 def execute_shell(cmd):
@@ -50,16 +70,80 @@ def execute_shell(cmd):
 
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     if result.returncode == 0:
-        return result.stdout
+        return slice(result.stdout)
     else:
-        return result.stderr
-
-parsed_data = json.loads(raw_text)
-if parsed_data["name"] == "run_shell":
-    cmd = parsed_data["args"]["cmd"]
-    observation = execute_shell(cmd)
-    print(observation)
-elif parsed_data["type"] == "final":
-    print("the ai says: [content]")
+        return slice(result.stderr)
 
 
+def read_file(path):
+    pass
+
+
+AVAILABLE_TOOLS = {
+        "run_shell": execute_shell,
+        "read_file": read_file
+        }
+
+
+
+
+
+while True:
+    user_input = input("\n==>>>")
+    if user_input.strip().lower() == ["exit", "quit", "bye"]:
+        print("Shutting down agent.")
+        break 
+
+    messages.append({"role": "user", "content": user_input})
+
+
+    while True:
+        output = llm.create_chat_completion(
+                messages=messages, 
+                grammar=grammar, 
+                max_tokens=1024
+        )
+
+        raw_text = output['choices'][0]['message']['content']
+
+        try:
+            parsed_data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            print(f"[SYSTEM] Bad Json generation. Retrying...")
+
+            messages.append({"role":"assistant","content":raw_text})
+            messages.append({"role":"user", "content":"Your last response was invalid JSON, Try Again..."})
+            continue
+
+        if parsed_data["type"] == "tool":
+            tool_name = parsed_data["name"]
+            tool_args = parsed_data["args"]
+
+            if tool_name in AVAILABLE_TOOLS:
+                observation = AVAILABLE_TOOLS[tool_name](**tool_args)
+            else:
+                observation = f"Error: Tool {tool_name} not found"
+
+            
+            if observation is None:
+                observation = "Success: Tool executed but returned no output."
+            else:
+                observation = str(observation)
+            
+            print(f"\n[DEBUG - OS Output]:\n{observation[:200]}...")
+
+
+            messages.append({"role": "assistant", "content": raw_text})
+            
+            messages.append({
+                "role": "user", 
+                "content": f"Observation from {tool_name}:\n{observation}\n\nNow provide the 'final' JSON answer."
+            })
+            continue
+        
+        elif parsed_data["type"] == "final":
+            content = parsed_data["content"]
+            print(f"\n[AI]: {content}")
+            
+            messages.append({"role": "assistant", "content": raw_text})
+            break
